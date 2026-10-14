@@ -1,4 +1,4 @@
-package com.yzl.concurrent;
+package com.yzl.consume;
 
 import org.junit.Test;
 

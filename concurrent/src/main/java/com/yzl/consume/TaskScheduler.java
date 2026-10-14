@@ -1,4 +1,4 @@
-package com.yzl.concurrent;
+package com.yzl.consume;
 
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
