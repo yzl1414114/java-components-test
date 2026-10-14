@@ -36,6 +36,7 @@
         <module>apache-commons</module>
         <module>groovy-test</module>
         <module>trace-test</module>
+        <module>concurrent</module>
     </modules>
 
     <properties>
