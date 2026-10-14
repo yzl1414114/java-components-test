@@ -1,8 +1,5 @@
-package com.yzl.concurrent.v2;
+package com.yzl.concurrent;
 
-import com.yzl.concurrent.ErrorCode;
-import com.yzl.concurrent.Task;
-import com.yzl.concurrent.TaskResult;
 import org.junit.Test;
 
 import java.util.ArrayList;

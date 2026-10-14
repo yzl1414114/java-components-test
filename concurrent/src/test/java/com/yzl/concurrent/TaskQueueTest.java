@@ -1,6 +1,5 @@
-package com.yzl.concurrent.v2;
+package com.yzl.concurrent;
 
-import com.yzl.concurrent.Task;
 import org.junit.Test;
 
 import java.util.concurrent.atomic.AtomicReference;

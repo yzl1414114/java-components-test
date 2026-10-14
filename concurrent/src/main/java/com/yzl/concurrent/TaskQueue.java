@@ -1,6 +1,4 @@
-package com.yzl.concurrent.v2;
-
-import com.yzl.concurrent.Task;
+package com.yzl.concurrent;
 
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;

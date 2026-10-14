@@ -1,7 +1,5 @@
-package com.yzl.concurrent.v2;
+package com.yzl.concurrent;
 
-import com.yzl.concurrent.HttpTaskClient;
-import com.yzl.concurrent.MockTaskServer;
 import org.junit.Test;
 
 import java.util.Random;

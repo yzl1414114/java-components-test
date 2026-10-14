@@ -1,111 +1,89 @@
 package com.yzl.concurrent;
 
-import java.io.IOException;
-import java.util.Deque;
-import java.util.List;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 高效任务执行器：
- * <ul>
- * <li>周期性从远端 HTTP 服务拉取任务，提交工作线程并发执行（任务有大有小，一般 1~5s 完成）</li>
- * <li>资源不够时，任务启动执行后 50ms 内返回 {@link ErrorCode#ERROR_RESOURCE_FULL}，
- *     该任务进入缓存队列，暂停拉取新任务</li>
- * <li>任一任务完成后立即重试缓存任务；或暂停满 probeIntervalMs 后试探执行一次</li>
- * </ul>
+ * 调度器（v2 思路）：
+ * <ol>
+ * <li>从 {@link TaskQueue} 取任务（优先重试队列）提交线程池；两队列都为空时通知 {@link TaskFetcher} 抓取并阻塞等待</li>
+ * <li>提交前检查 {@link #lastResult}：资源池满则暂停，最长 resourceFullPauseMs(1s)，
+ *     或被非资源满执行结果提前唤醒</li>
+ * <li>每次提交后 sleep submitIntervalMs(10ms) 节流，避免资源池满快速失败过多</li>
+ * <li>资源池满快速失败的任务放回 {@link TaskQueue} 重试队列，优先取出重新提交；并发达到 maxConcurrent 或线程池满时同样放回重试队列并暂停等待，任务不丢失</li>
+ * </ol>
  */
 public class TaskScheduler {
 
-    private final TaskClient client;
+    private final TaskFetcher fetcher;
+    private final TaskQueue taskQueue;
     private final TaskRunner runner;
-    private final ExecutorService workers;
-    private final int workerThreads;
-    private final int fetchBatch;
-    private final long probeIntervalMs;
-    private final long pollIntervalMs;
+    private final ThreadPoolExecutor pool;
+    private final int maxConcurrent;
+    private final long resourceFullPauseMs;
+    private final long submitIntervalMs;
     private final long startMs = System.currentTimeMillis();
 
-    /** 资源不足被缓存、等待重试的任务 */
-    private final Deque<Task> pending = new ConcurrentLinkedDeque<>();
-    /** 调度循环的唤醒锁：任一任务成功完成（资源释放）时唤醒 */
-    private final Object wakeLock = new Object();
-    private boolean woken;
-    /** 空闲状态等待锁：供 awaitIdle 使用 */
-    private final Object stateLock = new Object();
+    /**
+     * TaskRunner 每次执行完成后写入的最近一次执行结果
+     */
+    private volatile TaskResult lastResult;
 
-    private final AtomicBoolean paused = new AtomicBoolean(false);
-    private final AtomicBoolean fetchExhausted = new AtomicBoolean(false);
-    private final AtomicInteger inFlight = new AtomicInteger();
-
-    private final AtomicLong fetchedCount = new AtomicLong();
+    /**
+     * 资源池暂停唤醒信号：容量 1，非资源满任务完成时 offer，唤醒暂停等待（重复 offer 自动合并）
+     */
+    private final BlockingQueue<Boolean> pauseSignal = new ArrayBlockingQueue<>(1);
+    private final AtomicLong submittedCount = new AtomicLong();
     private final AtomicLong succeededCount = new AtomicLong();
     private final AtomicLong resourceRejectedCount = new AtomicLong();
-    private final AtomicLong cachedCount = new AtomicLong();
-    private final AtomicLong probeCount = new AtomicLong();
+    private final AtomicLong pauseCount = new AtomicLong();
     private final ConcurrentMap<String, TaskResult> results = new ConcurrentHashMap<>();
 
     private volatile boolean stopped;
     private Thread loopThread;
 
-    public TaskScheduler(TaskClient client, TaskRunner runner, int workerThreads,
-                         int fetchBatch, long probeIntervalMs, long pollIntervalMs) {
-        this.client = client;
+    public TaskScheduler(TaskFetcher fetcher, TaskRunner runner, int maxConcurrent,
+                         long resourceFullPauseMs, long submitIntervalMs) {
+        this.fetcher = fetcher;
+        this.taskQueue = fetcher.getTaskQueue();
         this.runner = runner;
-        this.workerThreads = workerThreads;
-        this.fetchBatch = fetchBatch;
-        this.probeIntervalMs = probeIntervalMs;
-        this.pollIntervalMs = pollIntervalMs;
+        this.maxConcurrent = maxConcurrent;
+        this.resourceFullPauseMs = resourceFullPauseMs;
+        this.submitIntervalMs = submitIntervalMs;
         ThreadFactory tf = new ThreadFactory() {
             private final AtomicInteger seq = new AtomicInteger();
 
             @Override
             public Thread newThread(Runnable r) {
-                Thread t = new Thread(r, "task-worker-" + seq.incrementAndGet());
+                Thread t = new Thread(r, "task-pool-" + seq.incrementAndGet());
                 t.setDaemon(true);
                 return t;
             }
         };
-        this.workers = Executors.newFixedThreadPool(workerThreads, tf);
+
+        // 线程池比并发闸门多 5 个线程余量，避免提交瞬间被池拒绝
+        int poolSize = maxConcurrent + 5;
+        this.pool = new ThreadPoolExecutor(Math.min(8, poolSize),
+                poolSize,
+                30 * 1000L,
+                TimeUnit.MILLISECONDS,
+                new SynchronousQueue<>(),  // 无缓冲队列
+                tf,
+                new ThreadPoolExecutor.AbortPolicy());
     }
 
     public void start() {
+        fetcher.start();
         loopThread = new Thread(this::loop, "task-scheduler");
         loopThread.setDaemon(true);
         loopThread.start();
     }
 
-    /**
-     * 等待远端任务全部取完、缓存清空且没有在途任务
-     *
-     * @return true 表示已空闲
-     */
-    public boolean awaitIdle(long timeoutMs) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        synchronized (stateLock) {
-            while (!isIdle()) {
-                long remain = deadline - System.currentTimeMillis();
-                if (remain <= 0) {
-                    return false;
-                }
-                stateLock.wait(Math.min(remain, 200));
-            }
-            return true;
-        }
-    }
-
     public void close() {
         stopped = true;
-        wake();
-        signalState();
-        workers.shutdownNow();
+        fetcher.stop();
+        pauseSignal.offer(Boolean.TRUE);
         if (loopThread != null) {
             loopThread.interrupt();
             try {
@@ -114,14 +92,38 @@ public class TaskScheduler {
                 Thread.currentThread().interrupt();
             }
         }
+        pool.shutdownNow();
+    }
+
+    /**
+     * 等待空闲：任务队列清空、无在途任务，且上次拉取远端为空。
+     * 远端任务可能持续产生，空闲只代表此刻没有待处理任务，之后可能有新任务到来
+     *
+     * @return true 表示已空闲
+     */
+    public boolean awaitIdle(long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (!isIdle()) {
+            long remain = deadline - System.currentTimeMillis();
+            if (remain <= 0) {
+                return false;
+            }
+            // 周期性重查空闲状态（远端拉取为空标志由抓取线程更新，无对应信号）
+            Thread.sleep(Math.min(remain, 200));
+        }
+        return true;
+    }
+
+    public TaskResult getLastResult() {
+        return lastResult;
     }
 
     public TaskResult getResult(String taskId) {
         return results.get(taskId);
     }
 
-    public long getFetchedCount() {
-        return fetchedCount.get();
+    public long getSubmittedCount() {
+        return submittedCount.get();
     }
 
     public long getSucceededCount() {
@@ -132,182 +134,124 @@ public class TaskScheduler {
         return resourceRejectedCount.get();
     }
 
-    public long getCachedCount() {
-        return cachedCount.get();
+    public long getPauseCount() {
+        return pauseCount.get();
     }
 
-    public long getProbeCount() {
-        return probeCount.get();
+    /**
+     * 任务执行完成后回调（runner.run 返回后由线程池任务调用）：写入 lastResult、唤醒暂停或转入重试队列
+     */
+    void onTaskDone(Task task, TaskResult result) {
+        results.put(task.getId(), result);
+        lastResult = result;
+        if (result.isResourceFull()) {
+            resourceRejectedCount.incrementAndGet();
+            taskQueue.putRetry(task);
+            log("任务 " + task.getId() + " 资源池满快速失败(" + result.getElapsedMs()
+                    + "ms, code=" + result.getCode() + ")，放回重试队列");
+            // 资源未释放，不唤醒暂停等待
+        } else {
+            if (result.isSuccess()) {
+                succeededCount.incrementAndGet();
+            }
+            log("任务 " + task.getId() + " " + (result.isSuccess() ? "执行成功" : "执行失败")
+                    + ", code=" + result.getCode() + ", elapsed=" + result.getElapsedMs()
+                    + "ms, inFlight=" + poolTaskCount());
+            // 资源已释放，唤醒调度器的暂停等待
+            pauseSignal.offer(Boolean.TRUE);
+        }
     }
 
     private void loop() {
-        while (!stopped) {
-            if (paused.get()) {
-                boolean byCompletion = waitForWake(probeIntervalMs);
-                if (stopped) {
-                    break;
-                }
-                if (!byCompletion) {
-                    probeCount.incrementAndGet();
-                    log("暂停超时，试探执行缓存任务");
-                }
-                drainPending();
-            } else {
-                drainPending();
-                fetchAndDispatch();
-                if (stopped) {
-                    break;
-                }
-                waitForWake(pollIntervalMs);
-            }
-        }
-    }
-
-    private void fetchAndDispatch() {
-        List<Task> batch;
         try {
-            batch = client.fetch(fetchBatch);
-        } catch (IOException e) {
-            log("拉取任务失败: " + e.getMessage());
-            return;
-        }
-        if (batch.isEmpty()) {
-            if (fetchExhausted.compareAndSet(false, true)) {
-                log("远端任务已全部取完");
+            while (!stopped) {
+                //等待资源
+                awaitResourcePool();
+                //取任务
+                Task task = nextTask();
+                if (task == null) {
+                    //没有取到任务，进入下一次循环
+                    continue;
+                }
+                if (submit(task)) {
+                    //提交成功，等待间隔时间
+                    Thread.sleep(submitIntervalMs);
+                } else {
+                    // 提交失败，重试
+                    taskQueue.putRetry(task);
+                    log("提交失败，任务 " + task.getId() + " 放回重试队列，暂停等待");
+                    await();
+                }
             }
-            signalState();
-            return;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-        fetchExhausted.set(false);
-        fetchedCount.addAndGet(batch.size());
-        log("拉取任务 " + batch.size() + " 个: " + ids(batch));
-        for (Task t : batch) {
-            dispatch(t);
-        }
+        log("调度线程结束");
     }
 
-    private void dispatch(Task task) {
-        if (inFlight.get() >= workerThreads) {
-            cache(task, "工作线程已满");
-            paused.set(true);
+    /**
+     * 取下一个任务：优先重试队列；两队列都为空则通知 TaskFetcher 抓取并阻塞等待
+     */
+    private Task nextTask() throws InterruptedException {
+        Task task = taskQueue.poll();
+        if (task == null) {
+            fetcher.notifyFetch();
+            task = taskQueue.poll(200);
+        }
+        return task;
+    }
+
+    /**
+     * 提交前检查 lastResult：资源池满则暂停等待（超时 1s 或由非资源满结果唤醒）
+     */
+    private void awaitResourcePool() throws InterruptedException {
+        // 根据上次结果判断是否资源满
+        TaskResult last = lastResult;
+        if (last == null || !last.isResourceFull()) {
             return;
         }
-        inFlight.incrementAndGet();
-        log("开始执行 " + task);
-        workers.submit(new Runnable() {
-            @Override
-            public void run() {
+        pauseCount.incrementAndGet();
+        log("资源池满(lastResult code=" + last.getCode() + ")，暂停等待");
+        pauseSignal.poll(resourceFullPauseMs, TimeUnit.MILLISECONDS);
+    }
+
+    private boolean submit(Task task) {
+        // 并发闸门：达到 maxConcurrent 不再提交，由调用方放回重试队列等待
+        if (poolTaskCount() >= maxConcurrent) {
+            return false;
+        }
+        try {
+            pool.submit(() -> {
                 TaskResult result;
                 try {
                     result = runner.run(task);
                 } catch (Throwable e) {
                     result = TaskResult.fail(task, ErrorCode.ERROR_INTERRUPTED, 0);
                 }
-                onDone(task, result);
-            }
-        });
+                onTaskDone(task, result);
+            });
+            submittedCount.incrementAndGet();
+            log("提交任务 " + task.getId() + ", 拉取队列=" + taskQueue.fetchSize()
+                    + ", 重试队列=" + taskQueue.retrySize() + ", inFlight=" + poolTaskCount());
+        } catch (RejectedExecutionException e) {
+            return false;
+        }
+        return true;
     }
 
-    private void onDone(Task task, TaskResult result) {
-        inFlight.decrementAndGet();
-        results.put(task.getId(), result);
-        if (result.isResourceFull()) {
-            resourceRejectedCount.incrementAndGet();
-            cache(task, "资源不足, " + result.getElapsedMs() + "ms 返回错误码 "
-                    + result.getCode());
-            // 暂停拉取与执行；资源未释放，不唤醒，等待运行中的任务完成或试探超时
-            paused.set(true);
-        } else {
-            if (result.isSuccess()) {
-                succeededCount.incrementAndGet();
-            }
-            log((result.isSuccess() ? "执行成功 " : "执行失败 ") + task.getId()
-                    + ", code=" + result.getCode() + ", elapsed=" + result.getElapsedMs() + "ms"
-                    + ", inFlight=" + inFlight.get());
-            // 有资源释放，唤醒调度循环重试缓存任务
-            wake();
-        }
-        signalState();
-    }
-
-    private void cache(Task task, String reason) {
-        pending.addLast(task);
-        cachedCount.incrementAndGet();
-        log("缓存任务 " + task.getId() + "（" + reason + "），缓存数=" + pending.size());
-    }
-
-    /** 重试缓存任务；缓存为空且处于暂停态时恢复拉取 */
-    private void drainPending() {
-        if (pending.isEmpty()) {
-            if (paused.compareAndSet(true, false)) {
-                log("缓存任务已清空，恢复拉取");
-                signalState();
-            }
-            return;
-        }
-        int n = 0;
-        Task t;
-        while ((t = pending.pollFirst()) != null) {
-            n++;
-            dispatch(t);
-        }
-        if (n > 0) {
-            log("重试缓存任务 " + n + " 个");
-        }
-    }
-
-    /**
-     * 等待唤醒信号，最多 timeoutMs
-     *
-     * @return true 表示被任务完成唤醒，false 表示超时（试探）
-     */
-    private boolean waitForWake(long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        synchronized (wakeLock) {
-            while (!woken && !stopped) {
-                long remain = deadline - System.currentTimeMillis();
-                if (remain <= 0) {
-                    break;
-                }
-                try {
-                    wakeLock.wait(remain);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            boolean wasWoken = woken;
-            woken = false;
-            return wasWoken;
-        }
-    }
-
-    private void wake() {
-        synchronized (wakeLock) {
-            woken = true;
-            wakeLock.notifyAll();
-        }
+    private void await() throws InterruptedException {
+        pauseSignal.poll(resourceFullPauseMs, TimeUnit.MILLISECONDS);
     }
 
     private boolean isIdle() {
-        return fetchExhausted.get() && pending.isEmpty() && inFlight.get() == 0;
+        return fetcher.isLastFetchEmpty() && taskQueue.isEmpty() && poolTaskCount() == 0;
     }
 
-    private void signalState() {
-        synchronized (stateLock) {
-            stateLock.notifyAll();
-        }
-    }
-
-    private static String ids(List<Task> tasks) {
-        StringBuilder sb = new StringBuilder();
-        for (Task t : tasks) {
-            if (sb.length() > 0) {
-                sb.append(',');
-            }
-            sb.append(t.getId()).append('(').append(t.getDurationMs()).append("ms)");
-        }
-        return sb.toString();
+    /**
+     * 池内任务数：正在执行 + 在池队列排队中（getActiveCount 只统计前者）
+     */
+    private int poolTaskCount() {
+        return pool.getActiveCount() + pool.getQueue().size();
     }
 
     private void log(String msg) {
